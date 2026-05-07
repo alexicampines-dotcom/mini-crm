@@ -7,12 +7,12 @@ Mini CRM colaborativo multi-tenant construido con Next.js, Supabase y TypeScript
 ### Cuentas de prueba
 **Organización 1 — AC Enterprise**
 - Email: `alexicampines@gmail.com`
-- Contraseña: (1234567)
+- Contraseña: (Solicitarlas)
 - Rol: Owner
 
 **Organización 2**
 - Email: `(campinesperez01@gmail.com)`
-- Contraseña: (1234567)
+- Contraseña: Solicitarlas)
 - Rol: Owner
 
 ## Funcionalidades
