@@ -1,13 +1,10 @@
--- Mini CRM — Schema completo con RLS, funciones y triggers
+-- Mini CRM — Schema completo y actualizado
 -- Ejecutar en: Supabase → SQL Editor → New Query
 
--- pgcrypto se necesita para gen_random_bytes (token de invitaciones).
--- gen_random_uuid() ya está disponible en PostgreSQL 13+, pero pgcrypto es necesario para el token de invitación.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- TABLAS
 
--- Cada empresa que usa el CRM
 CREATE TABLE IF NOT EXISTS organizations (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name       TEXT NOT NULL,
@@ -15,15 +12,12 @@ CREATE TABLE IF NOT EXISTS organizations (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Espejo de auth.users en el schema público.
--- Necesario porque auth.users no es accesible desde el frontend.
 CREATE TABLE IF NOT EXISTS profiles (
   id         UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   email      TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Relación usuario ↔ organización con su rol
 CREATE TABLE IF NOT EXISTS organization_members (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -33,7 +27,6 @@ CREATE TABLE IF NOT EXISTS organization_members (
   UNIQUE(organization_id, user_id)
 );
 
--- Invitaciones por email con link único de 7 días
 CREATE TABLE IF NOT EXISTS invitations (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -46,7 +39,6 @@ CREATE TABLE IF NOT EXISTS invitations (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Contactos del CRM con soft delete
 CREATE TABLE IF NOT EXISTS contacts (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -62,15 +54,12 @@ CREATE TABLE IF NOT EXISTS contacts (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Índice parcial: solo contactos activos (los borrados no se buscan)
 CREATE INDEX IF NOT EXISTS contacts_org_idx
   ON contacts(organization_id) WHERE deleted_at IS NULL;
 
--- Índice GIN para filtrar por tags rápido
 CREATE INDEX IF NOT EXISTS contacts_tags_idx
   ON contacts USING GIN(tags);
 
--- Log de actividades para el dashboard
 CREATE TABLE IF NOT EXISTS activities (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -85,7 +74,7 @@ CREATE INDEX IF NOT EXISTS activities_org_idx
   ON activities(organization_id, created_at DESC);
 
 -- PERMISOS
--- Las tablas creadas por SQL necesitan GRANT explícito
+-- Necesarios porque las tablas se crean por SQL no por el Table Editor
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;
@@ -96,7 +85,6 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO anon;
 
 -- FUNCIONES HELPER PARA RLS
 
--- Devuelve el ID de la organización del usuario actual
 CREATE OR REPLACE FUNCTION get_my_org_id()
 RETURNS UUID
 LANGUAGE sql STABLE SECURITY DEFINER
@@ -108,7 +96,6 @@ AS $$
   LIMIT 1;
 $$;
 
--- Devuelve el rol del usuario actual en su organización
 CREATE OR REPLACE FUNCTION my_role()
 RETURNS TEXT
 LANGUAGE sql STABLE SECURITY DEFINER
@@ -141,8 +128,8 @@ AS $$
   );
 $$;
 
+
 -- ROW LEVEL SECURITY
--- ============================================================
 
 ALTER TABLE organizations        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE profiles             ENABLE ROW LEVEL SECURITY;
@@ -151,7 +138,7 @@ ALTER TABLE invitations          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE contacts             ENABLE ROW LEVEL SECURITY;
 ALTER TABLE activities           ENABLE ROW LEVEL SECURITY;
 
--- Organizations: solo ves la tuya, nadie puede crear directamente
+-- Organizations
 CREATE POLICY "ver mi organizacion"
   ON organizations FOR SELECT
   USING (id = get_my_org_id());
@@ -160,7 +147,8 @@ CREATE POLICY "bloquear insert directo en orgs"
   ON organizations FOR INSERT
   WITH CHECK (false);
 
--- Profiles: ves tu perfil y los de tu equipo
+-- Profiles: visible para todos los autenticados
+-- La seguridad real está en contacts y activities
 CREATE POLICY "ver perfiles"
   ON profiles FOR SELECT
   USING (true);
@@ -169,7 +157,8 @@ CREATE POLICY "bloquear insert directo en perfiles"
   ON profiles FOR INSERT
   WITH CHECK (false);
 
--- Organization members: cada usuario ve solo su propia membresía
+-- Organization members
+-- Cada usuario ve solo su propia membresía
 -- Los miembros del equipo se obtienen via get_team_members()
 CREATE POLICY "ver mi membresia"
   ON organization_members FOR SELECT
@@ -184,16 +173,23 @@ CREATE POLICY "bloquear insert directo de miembros"
   ON organization_members FOR INSERT
   WITH CHECK (false);
 
+-- Policy de DELETE sin recursión: verifica directamente si el usuario es owner
 CREATE POLICY "owner remueve miembros"
   ON organization_members FOR DELETE
-  USING (organization_id = get_my_org_id() AND my_role() = 'owner');
+  USING (
+    user_id != auth.uid()
+    AND organization_id IN (
+      SELECT organization_id FROM organization_members
+      WHERE user_id = auth.uid() AND role = 'owner'
+    )
+  );
 
 -- Invitations: solo el owner puede gestionar invitaciones
 CREATE POLICY "owner gestiona invitaciones"
   ON invitations FOR ALL
   USING (organization_id = get_my_org_id() AND my_role() = 'owner');
 
--- Contacts: cualquier miembro ve y crea, solo owner/admin elimina via RPC
+-- Contacts
 CREATE POLICY "ver contactos activos"
   ON contacts FOR SELECT
   USING (organization_id = get_my_org_id() AND deleted_at IS NULL);
@@ -206,7 +202,7 @@ CREATE POLICY "actualizar contactos"
   ON contacts FOR UPDATE
   USING (organization_id = get_my_org_id() AND deleted_at IS NULL);
 
--- Activities: solo lectura desde el frontend, los triggers insertan
+-- Activities
 CREATE POLICY "ver actividades del equipo"
   ON activities FOR SELECT
   USING (organization_id = get_my_org_id());
@@ -217,7 +213,7 @@ CREATE POLICY "bloquear insert directo de actividades"
 
 -- TRIGGERS Y FUNCIONES
 
--- Cuando se crea un usuario en Supabase Auth, crea su profile y org
+-- Crea profile y organización al registrarse
 CREATE OR REPLACE FUNCTION handle_new_user()
 RETURNS TRIGGER
 LANGUAGE plpgsql SECURITY DEFINER
@@ -228,17 +224,14 @@ DECLARE
   org_slug   TEXT;
   org_name   TEXT;
 BEGIN
-  -- Crear el perfil espejo
   INSERT INTO profiles (id, email)
   VALUES (NEW.id, NEW.email)
   ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email;
 
-  -- Si el usuario viene de una invitación, no crear organización nueva
   IF (NEW.raw_user_meta_data->>'skip_org_creation')::boolean IS TRUE THEN
     RETURN NEW;
   END IF;
 
-  -- Slug simplificado: usar nombre o email + sufijo aleatorio único
   org_name := coalesce(
     nullif(trim(NEW.raw_user_meta_data->>'org_name'), ''),
     split_part(NEW.email, '@', 1)
@@ -247,7 +240,6 @@ BEGIN
   org_slug := lower(regexp_replace(org_name, '[^a-z0-9]+', '-', 'g'))
               || '-' || floor(random() * 9000 + 1000)::text;
 
-  -- Crear la organización con el usuario como owner
   INSERT INTO organizations (name, slug)
   VALUES (org_name, org_slug)
   RETURNING id INTO new_org_id;
@@ -263,7 +255,7 @@ CREATE OR REPLACE TRIGGER on_auth_user_created
   AFTER INSERT ON auth.users
   FOR EACH ROW EXECUTE FUNCTION handle_new_user();
 
--- Actualizar updated_at automáticamente al editar contactos
+-- Actualiza updated_at automáticamente
 CREATE OR REPLACE FUNCTION update_contact_timestamp()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
@@ -276,7 +268,7 @@ CREATE OR REPLACE TRIGGER contacts_updated_at
   BEFORE UPDATE ON contacts
   FOR EACH ROW EXECUTE FUNCTION update_contact_timestamp();
 
--- Registrar actividades automáticamente al crear/editar/borrar contactos
+-- Registra actividades automáticamente
 CREATE OR REPLACE FUNCTION log_contact_activity()
 RETURNS TRIGGER
 LANGUAGE plpgsql SECURITY DEFINER
@@ -308,6 +300,9 @@ $$;
 CREATE OR REPLACE TRIGGER contact_activity_trigger
   AFTER INSERT OR UPDATE ON contacts
   FOR EACH ROW EXECUTE FUNCTION log_contact_activity();
+
+
+-- FUNCIONES RPC
 
 -- Lectura pública de invitación (antes de hacer login)
 CREATE OR REPLACE FUNCTION get_invitation_info(p_token TEXT)
@@ -341,7 +336,7 @@ BEGIN
 END;
 $$;
 
--- Aceptar invitación: agrega al usuario autenticado a la organización
+-- Aceptar invitación
 CREATE OR REPLACE FUNCTION accept_invitation(p_token TEXT)
 RETURNS JSONB
 LANGUAGE plpgsql SECURITY DEFINER
@@ -383,7 +378,7 @@ BEGIN
 END;
 $$;
 
--- Cambio de rol (solo owner, no puede cambiar su propio rol)
+-- Cambio de rol (solo owner)
 CREATE OR REPLACE FUNCTION update_member_role(p_member_id UUID, p_role TEXT)
 RETURNS VOID
 LANGUAGE plpgsql SECURITY DEFINER
@@ -409,7 +404,7 @@ BEGIN
 END;
 $$;
 
--- Soft delete con verificación de rol (solo owner y admin)
+-- Soft delete (solo owner y admin)
 CREATE OR REPLACE FUNCTION soft_delete_contact(p_contact_id UUID)
 RETURNS VOID
 LANGUAGE plpgsql SECURITY DEFINER
@@ -425,5 +420,26 @@ BEGIN
   WHERE id = p_contact_id
     AND organization_id = get_my_org_id()
     AND deleted_at IS NULL;
+END;
+$$;
+
+-- Eliminar miembro del equipo (solo owner)
+CREATE OR REPLACE FUNCTION remove_member(p_user_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF my_role() != 'owner' THEN
+    RAISE EXCEPTION 'Solo el owner puede eliminar miembros';
+  END IF;
+
+  IF p_user_id = auth.uid() THEN
+    RAISE EXCEPTION 'No puede eliminarse a sí mismo';
+  END IF;
+
+  DELETE FROM organization_members
+  WHERE user_id = p_user_id
+    AND organization_id = get_my_org_id();
 END;
 $$;
