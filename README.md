@@ -92,3 +92,10 @@ Cosas como aceptar invitaciones, cambiar roles o eliminar contactos se manejan c
 
 **Tags como array de texto**
 Las etiquetas se guardan directamente en la tabla de contactos como `TEXT[]` con un índice GIN. No necesité una tabla separada y las búsquedas por etiqueta son rápidas.
+
+## Limitaciones conocidas
+
+**Rate limit de emails en desarrollo**
+El plan gratuito de Supabase limita el envío de emails a 2 por hora. Esto afecta el registro de nuevos usuarios y el flujo de invitaciones durante las pruebas. En un entorno de producción real se configuraría un proveedor SMTP externo como Resend o SendGrid desde Supabase → Settings → Auth → SMTP Settings.
+
+El flujo de invitación está completamente implementado — el link se genera correctamente, expira en 7 días y es de un solo uso. La limitación es exclusiva del plan gratuito para desarrollo.
